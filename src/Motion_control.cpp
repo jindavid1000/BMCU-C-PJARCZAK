@@ -307,6 +307,12 @@ static uint8_t manual_feed_armed[4] = {1u,1u,1u,1u};
 static uint64_t manual_feed_start_ms[4] = {0ull,0ull,0ull,0ull};
 static uint64_t manual_feed_stall_t0_ms[4] = {0ull,0ull,0ull,0ull};
 static uint32_t manual_feed_last_count[4] = {0u,0u,0u,0u};
+// Remember channels the printer has driven.  After a print stops, filament can
+// still be in the extruder even though the host has marked the channel idle.
+// Keep manual feed disabled until that channel's buffer has returned to and
+// held a neutral/low position, or the filament is removed from BMCU.
+static uint8_t host_hold_seen[4] = {0u,0u,0u,0u};
+static uint64_t host_hold_neutral_t0_ms[4] = {0ull,0ull,0ull,0ull};
 #endif
 
 bool filament_channel_inserted[4]       = {false, false, false, false}; // czy kanał fizycznie wpięty
@@ -2841,9 +2847,38 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks)
         // loaded channel; printer commands and all protection states win.
         // The stall/time limits are intentionally hidden from the user.
         auto &host_ams = ams[motion_control_ams_num];
+        // Release a recently host-driven channel only after its buffer has
+        // stayed neutral/low for one second while the host is no longer
+        // driving it.  If the extruder is still retracting, the buffer will
+        // stay high and manual feed remains blocked.
+        if (host_hold_seen[i])
+        {
+            if (ks_local == 0u)
+            {
+                host_hold_seen[i] = 0u;
+                host_hold_neutral_t0_ms[i] = 0ull;
+            }
+            else if (host_ams.filament[i].motion == _filament_motion::idle &&
+                     manual_pct <= MANUAL_FEED_RELEASE_PCT)
+            {
+                if (host_hold_neutral_t0_ms[i] == 0ull)
+                    host_hold_neutral_t0_ms[i] = time_now;
+                else if ((time_now - host_hold_neutral_t0_ms[i]) >= 1000ull)
+                {
+                    host_hold_seen[i] = 0u;
+                    host_hold_neutral_t0_ms[i] = 0ull;
+                }
+            }
+            else
+            {
+                host_hold_neutral_t0_ms[i] = 0ull;
+            }
+        }
+
         const bool manual_feed_allowed =
             !error &&
             (ks_local == 1u) &&
+            !host_hold_seen[i] &&
             (dm_auto_state[i] == DM_AUTO_IDLE) &&
             !dm_fail_latch[i] &&
             !auto_unload_active[i] &&
@@ -3050,6 +3085,15 @@ void Motion_control_run(int error)
         ams_state_set_unloaded(loaded_ch);
 
     auto &A = ams[motion_control_ams_num];
+
+#if BMCU_REVERSE_MANUAL_BUFFER && BMCU_DM_TWO_MICROSWITCH
+    // Latch any channel that the host is actively driving.  The latch survives
+    // the host returning the channel to idle, because filament may still be in
+    // the extruder at that point.
+    if (A.now_filament_num < kChCount &&
+        A.filament[A.now_filament_num].motion != _filament_motion::idle)
+        host_hold_seen[A.now_filament_num] = 1u;
+#endif
 
     for (uint8_t ch = 0; ch < kChCount; ch++)
     {
